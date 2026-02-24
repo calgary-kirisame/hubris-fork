@@ -475,6 +475,14 @@ pub fn apply_memory_protection(task: &task::Task) {
         &*cortex_m::peripheral::MPU::PTR
     };
 
+    // MPU_TYPE.DREGION (bits [15:8]) reports the number of supported regions.
+    // Some chips (e.g. Microchip MEC1521) have el cheapo Cortex M4s with no
+    // MPU, so DREGION is 0 and all MPU register writes are RAZ/WI.
+    // So, unfortunately, there's nothing to configure.
+    if mpu.type_.read() & 0xFF00 == 0 {
+        return;
+    }
+
     // Turn off the MPU.
     //
     // Safety: this has no actual memory safety implications, except for
@@ -757,21 +765,21 @@ pub fn start_first_task(tick_divisor: u32, task: &task::Task) -> ! {
         // Enable counter and interrupt.
         syst.csr.modify(|v| v | 0b111);
     }
-    // We are manufacturing authority to interact with the MPU here, because we
-    // can't thread a cortex-specific peripheral through an
-    // architecture-independent API. This approach might bear revisiting later.
+    // Enable the MPU if the chip has one. On chips without,
+    // MPU_TYPE.DREGION == 0 and the CTRL write is RAZ/WI,
+    // but we skip it explicitly to make the intent clear
     let mpu = unsafe {
-        // At least by not taking a &mut we're confident we're not violating
-        // aliasing....
         &*cortex_m::peripheral::MPU::PTR
     };
 
-    const ENABLE: u32 = 0b001;
-    const PRIVDEFENA: u32 = 0b100;
-    // Safety: this has no memory safety implications. The worst it can do is
-    // cause us to fault, which is safe. The register API doesn't know this.
-    unsafe {
-        mpu.ctrl.write(ENABLE | PRIVDEFENA);
+    if mpu.type_.read() & 0xFF00 != 0 {
+        const ENABLE: u32 = 0b001;
+        const PRIVDEFENA: u32 = 0b100;
+        // Safety: this has no memory safety implications. The worst it can do
+        // is cause us to fault, which is safe.
+        unsafe {
+            mpu.ctrl.write(ENABLE | PRIVDEFENA);
+        }
     }
 
     CURRENT_TASK_PTR.store(task as *const _ as *mut _, Ordering::Relaxed);
