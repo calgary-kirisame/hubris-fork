@@ -130,37 +130,43 @@ pub struct SavedState {
     exc_return: u32,
 
     // gosh it would sure be nice if cfg_if were legal here
-    #[cfg(any(armv7m, armv8m))]
+    //
+    // These hold the callee-save FP registers across a context switch, so they
+    // only exist when an FPU is fitted (`has_fpu`). On a soft-float core like
+    // the MEC1521 there are no FP registers, so the save area ends at
+    // `exc_return` and the assembly below omits the `vstm`/`vldm` that would
+    // populate these.
+    #[cfg(has_fpu)]
     s16: u32,
-    #[cfg(any(armv7m, armv8m))]
+    #[cfg(has_fpu)]
     s17: u32,
-    #[cfg(any(armv7m, armv8m))]
+    #[cfg(has_fpu)]
     s18: u32,
-    #[cfg(any(armv7m, armv8m))]
+    #[cfg(has_fpu)]
     s19: u32,
-    #[cfg(any(armv7m, armv8m))]
+    #[cfg(has_fpu)]
     s20: u32,
-    #[cfg(any(armv7m, armv8m))]
+    #[cfg(has_fpu)]
     s21: u32,
-    #[cfg(any(armv7m, armv8m))]
+    #[cfg(has_fpu)]
     s22: u32,
-    #[cfg(any(armv7m, armv8m))]
+    #[cfg(has_fpu)]
     s23: u32,
-    #[cfg(any(armv7m, armv8m))]
+    #[cfg(has_fpu)]
     s24: u32,
-    #[cfg(any(armv7m, armv8m))]
+    #[cfg(has_fpu)]
     s25: u32,
-    #[cfg(any(armv7m, armv8m))]
+    #[cfg(has_fpu)]
     s26: u32,
-    #[cfg(any(armv7m, armv8m))]
+    #[cfg(has_fpu)]
     s27: u32,
-    #[cfg(any(armv7m, armv8m))]
+    #[cfg(has_fpu)]
     s28: u32,
-    #[cfg(any(armv7m, armv8m))]
+    #[cfg(has_fpu)]
     s29: u32,
-    #[cfg(any(armv7m, armv8m))]
+    #[cfg(has_fpu)]
     s30: u32,
-    #[cfg(any(armv7m, armv8m))]
+    #[cfg(has_fpu)]
     s31: u32,
     // NOTE: the above fields must be kept contiguous!
 }
@@ -236,8 +242,10 @@ pub struct BaseExceptionFrame {
 }
 
 cfg_if::cfg_if! {
-    if #[cfg(any(armv7m, armv8m))] {
-        /// Extended version for FPU.
+    if #[cfg(has_fpu)] {
+        /// Extended version for FPU. On exception entry an FPU-equipped core
+        /// stacks 16 FP registers plus FPSCR (plus a reserved word for
+        /// alignment) on top of the base frame.
         #[derive(Debug, FromBytes, Default)]
         #[repr(C)]
         pub struct ExtendedExceptionFrame {
@@ -246,15 +254,15 @@ cfg_if::cfg_if! {
             fpscr: u32,
             reserved: u32,
         }
-    } else if #[cfg(armv6m)] {
-        /// Wee version for non-FPU.
+    } else {
+        /// Wee version for non-FPU cores (ARMv6-M, or soft-float ARMv7E-M like
+        /// the MEC1521). The hardware never stacks FP context here, so the
+        /// exception frame is just the base frame.
         #[derive(Debug, FromBytes, Default)]
         #[repr(C)]
         pub struct ExtendedExceptionFrame {
             base: BaseExceptionFrame,
         }
-    } else {
-        compile_error!("unknown M-profile");
     }
 }
 
@@ -262,17 +270,32 @@ cfg_if::cfg_if! {
 const INITIAL_PSR: u32 = 1 << 24;
 
 /// We don't really care about the initial FPU mode; 0 is reasonable.
-#[cfg(any(armv7m, armv8m))]
+#[cfg(has_fpu)]
 const INITIAL_FPSCR: u32 = 0;
 
-/// EXC_RETURN is used on ARMv8m to return from an exception. This value
-/// differs between secure and non-secure in two important ways:
+/// EXC_RETURN is the magic LR value used to return from an exception. We use it
+/// in two places: to bootstrap the first task, and (saved per-task) to resume a
+/// task after a context switch.
+///
+/// Bit 4 (FType) selects the exception-frame format: 0 = extended (FP) frame,
+/// 1 = basic frame. On an FPU-equipped core we manufacture an extended frame
+/// (`0x…ED`) so the FP context gets stacked/unstacked. On a core without an FPU
+/// (ARMv6-M, or soft-float ARMv7E-M like the MEC1521) bit 4 is RES1 and the
+/// hardware never stacks FP context, so we must use a basic-frame value
+/// (`0x…FD`); setting FType=0 on such a core is UNPREDICTABLE and would desync
+/// the stack frame the kernel assembles.
+///
+/// On ARMv8-M this value also differs between secure and non-secure in two
+/// important ways:
 /// bit 6 = S = secure or non-secure stack used
 /// bit 0 = ES = the security domain the exception was taken to
 /// These need to be consistent! The failure mode is a secure fault otherwise.
 /// We currently assume that TrustZone has not been enabled (even on the parts
 /// that support it) (and that bit 6 and bit 0 can always be set).
+#[cfg(has_fpu)]
 const EXC_RETURN_CONST: u32 = 0xFFFFFFED;
+#[cfg(not(has_fpu))]
+const EXC_RETURN_CONST: u32 = 0xFFFFFFFD;
 
 /// Sets the kernel's notion of our clock frequency measured in kHz.
 ///
@@ -353,7 +376,7 @@ pub fn reinitialize(task: &mut task::Task) {
     frame.base.pc = descriptor.entry_point | 1; // for thumb
     frame.base.xpsr = INITIAL_PSR;
     frame.base.lr = 0xFFFF_FFFF; // trap on return from main
-    #[cfg(any(armv7m, armv8m))]
+    #[cfg(has_fpu)]
     {
         frame.fpscr = INITIAL_FPSCR;
     }
@@ -476,10 +499,10 @@ pub fn apply_memory_protection(task: &task::Task) {
     };
 
     // MPU_TYPE.DREGION (bits [15:8]) reports the number of supported regions.
-    // Some chips (e.g. Microchip MEC1521) have el cheapo Cortex M4s with no
+    // Some chips (e.g. Microchip MEC1521) have el cheapo Cortex parts with no
     // MPU, so DREGION is 0 and all MPU register writes are RAZ/WI.
-    // So, unfortunately, there's nothing to configure.
-    if mpu.type_.read() & 0xFF00 == 0 {
+    // Unfortunately, there's nothing to configure.
+    if mpu._type.read() & 0xFF00 == 0 {
         return;
     }
 
@@ -772,7 +795,7 @@ pub fn start_first_task(tick_divisor: u32, task: &task::Task) -> ! {
         &*cortex_m::peripheral::MPU::PTR
     };
 
-    if mpu.type_.read() & 0xFF00 != 0 {
+    if mpu._type.read() & 0xFF00 != 0 {
         const ENABLE: u32 = 0b001;
         const PRIVDEFENA: u32 = 0b100;
         // Safety: this has no memory safety implications. The worst it can do
@@ -956,7 +979,7 @@ cfg_if::cfg_if! {
         ",
         exc_return = const EXC_RETURN_CONST,
         }
-    } else if #[cfg(any(armv7m, armv8m))] {
+    } else if #[cfg(all(any(armv7m, armv8m), has_fpu))] {
         global_asm!{"
             .section .text.SVCall
             .globl SVCall
@@ -1012,6 +1035,69 @@ cfg_if::cfg_if! {
 
                 mov lr, {exc_return}    @ materialize EXC_RETURN value to
                                         @ return into thread mode, PSP, FP on
+
+                bx lr                   @ branch into user mode
+            ",
+            exc_return = const EXC_RETURN_CONST,
+        }
+    } else if #[cfg(any(armv7m, armv8m))] {
+        // Same as the FPU variant above, but for a soft-float core (e.g. the
+        // MEC1521) there are no s16-s31 to preserve, so the `vstm`/`vldm` are
+        // gone and the task save area ends at `exc_return`. Keep this in sync
+        // with the FPU variant modulo those two instructions.
+        global_asm!{"
+            .section .text.SVCall
+            .globl SVCall
+            .type SVCall,function
+            SVCall:
+                @ Inspect LR to figure out the caller's mode.
+                mov r0, lr
+                mov r1, #0xFFFFFFF3
+                bic r0, r1
+                @ Is the call coming from thread mode + main stack, i.e.
+                @ from the kernel startup routine?
+                cmp r0, #0x8
+                @ If so, this is startup; jump ahead. The common case falls
+                @ through because branch-not-taken tends to be faster on small
+                @ cores.
+                beq 1f
+
+                @ store volatile state.
+                @ first, get a pointer to the current task.
+                movw r0, #:lower16:CURRENT_TASK_PTR
+                movt r0, #:upper16:CURRENT_TASK_PTR
+                ldr r1, [r0]
+                movs r2, r1
+                @ fetch the process-mode stack pointer.
+                @ fetching into r12 means the order in the stm below is right.
+                mrs r12, PSP
+                @ now, store volatile registers, plus the PSP in r12, plus LR.
+                stm r2!, {{r4-r12, lr}}
+
+                @ syscall number is passed in r11. Move it into r0 to pass it as
+                @ an argument to the handler, then call the handler.
+                movs r0, r11
+                bl syscall_entry
+
+                @ we're returning back to *some* task, maybe not the same one.
+                movw r0, #:lower16:CURRENT_TASK_PTR
+                movt r0, #:upper16:CURRENT_TASK_PTR
+                ldr r0, [r0]
+                @ restore volatile registers, plus load PSP into r12
+                ldm r0!, {{r4-r12, lr}}
+                msr PSP, r12
+
+                @ resume
+                bx lr
+
+            1:  @ starting up the first task.
+                movs r0, #1         @ get bitmask to...
+                msr CONTROL, r0     @ ...shed privs from thread mode.
+                                    @ note: now barrier here because exc return
+                                    @ serves as barrier
+
+                mov lr, {exc_return}    @ materialize EXC_RETURN value to
+                                        @ return into thread mode, PSP, no FP
 
                 bx lr                   @ branch into user mode
             ",
@@ -1211,7 +1297,7 @@ cfg_if::cfg_if! {
                 bx lr
             ",
         }
-    } else if #[cfg(any(armv7m, armv8m))] {
+    } else if #[cfg(all(any(armv7m, armv8m), has_fpu))] {
         global_asm!{"
             .section .text.PendSV
             .globl PendSV
@@ -1238,6 +1324,39 @@ cfg_if::cfg_if! {
                 @ restore volatile registers, plus load PSP into r12
                 ldm r0!, {{r4-r12, lr}}
                 vldm r0, {{s16-s31}}
+                msr PSP, r12
+
+                @ resume
+                bx lr
+            ",
+        }
+    } else if #[cfg(any(armv7m, armv8m))] {
+        // Soft-float counterpart of the PendSV handler above: no s16-s31, so no
+        // `vstm`/`vldm`. Keep in sync with the FPU variant modulo those two.
+        global_asm!{"
+            .section .text.PendSV
+            .globl PendSV
+            .type PendSV,function
+            PendSV:
+                @ store volatile state.
+                @ first, get a pointer to the current task.
+                movw r0, #:lower16:CURRENT_TASK_PTR
+                movt r0, #:upper16:CURRENT_TASK_PTR
+                ldr r1, [r0]
+                @ fetch the process-mode stack pointer.
+                @ fetching into r12 means the order in the stm below is right.
+                mrs r12, PSP
+                @ now, store volatile registers, plus the PSP in r12, plus LR.
+                stm r1!, {{r4-r12, lr}}
+
+                bl pendsv_entry
+
+                @ we're returning back to *some* task, maybe not the same one.
+                movw r0, #:lower16:CURRENT_TASK_PTR
+                movt r0, #:upper16:CURRENT_TASK_PTR
+                ldr r0, [r0]
+                @ restore volatile registers, plus load PSP into r12
+                ldm r0!, {{r4-r12, lr}}
                 msr PSP, r12
 
                 @ resume
@@ -1474,7 +1593,7 @@ enum FaultType {
     UsageFault = 6,
 }
 
-#[cfg(any(armv7m, armv8m))]
+#[cfg(all(any(armv7m, armv8m), has_fpu))]
 global_asm! {"
     .section .text.configurable_fault
     .globl configurable_fault
@@ -1524,6 +1643,74 @@ global_asm! {"
         @ Restore volatile registers, plus load PSP into r12
         ldm r0!, {{r4-r12, lr}}
         vldm r0, {{s16-s31}}
+        msr PSP, r12
+
+        @ resume
+        bx lr
+
+    .section .text.MemoryManagement
+    .globl MemoryManagement
+    .type MemoryManagement,function
+    MemoryManagement:
+        b configurable_fault
+
+    .section .text.BusFault
+    .globl BusFault
+    .type BusFault,function
+    BusFault:
+        b configurable_fault
+
+    .section .text.UsageFault
+    .globl UsageFault
+    .type UsageFault,function
+    UsageFault:
+        b configurable_fault
+    ",
+}
+
+// Soft-float ARMv7E-M / ARMv8-M Main (e.g. the MEC1521): identical to the
+// FPU variant above except there are no floating point registers to restore,
+// so the trailing `vldm` is gone. We still set up r2 the same way (it lands on
+// the no-op FP save area pointer that handle_fault ignores on this profile), so
+// handle_fault keeps a single calling convention across FPU and non-FPU cores.
+#[cfg(all(any(armv7m, armv8m), not(has_fpu)))]
+global_asm! {"
+    .section .text.configurable_fault
+    .globl configurable_fault
+    .type configurable_fault,function
+    .cpu cortex-m4  @ least common denominator we support
+    configurable_fault:
+        @ Read the current task pointer.
+        movw r0, #:lower16:CURRENT_TASK_PTR
+        movt r0, #:upper16:CURRENT_TASK_PTR
+        ldr r0, [r0]
+        mrs r12, PSP
+
+        @ Save our context to aid debugging the fault. Some of it (r0-r3, r12,
+        @ LR, return address, xPSR) is already on the stack from exception
+        @ entry; we store the rest, plus the PSP (now in r12), plus exc_return
+        @ (now in LR) into the task's save area. There are no floating point
+        @ registers on this profile, so unlike the FPU variant we have nothing
+        @ to defer to handle_fault.
+        mov r2, r0
+        stm r2!, {{r4-r12, lr}}
+
+        @ Pull our fault number out of IPSR, allowing for program text to be
+        @ shared across all configurable faults.  (Note that the exception
+        @ number is the bottom 9 bits, but we need only look at the bottom 4
+        @ bits as this handler is only used for exceptions with numbers less
+        @ than 16.)
+        mrs r1, IPSR
+        and r1, r1, #0xf
+        bl handle_fault
+
+        @ Our task has changed; reload it.
+        movw r0, #:lower16:CURRENT_TASK_PTR
+        movt r0, #:upper16:CURRENT_TASK_PTR
+        ldr r0, [r0]
+
+        @ Restore volatile registers, plus load PSP into r12
+        ldm r0!, {{r4-r12, lr}}
         msr PSP, r12
 
         @ resume
@@ -1920,6 +2107,15 @@ unsafe extern "C" fn handle_fault(
         scb.cfsr.write(cfsr.bits());
     }
 
+    // On a soft-float core there are no FP registers to preserve, so the
+    // lazy-stacking guard and the FP save below compile out; the asm still
+    // hands us `fpsave` (a now-meaningless pointer) and we still compute
+    // `stackinvalid`, so quiet the unused warnings for what those blocks would
+    // have consumed.
+    #[cfg(not(has_fpu))]
+    let _ = (fpsave, stackinvalid);
+
+    #[cfg(has_fpu)]
     if stackinvalid {
         // We know that we have an invalid stack; to prevent our subsequent
         // save of the dead task's floating point registers from storing
@@ -1939,6 +2135,7 @@ unsafe extern "C" fn handle_fault(
     // Safety: asm! is always unsafe, obvs, but in this case as long as fpsave
     // points to a correctly aligned area large enough to store 16 floats -- a
     // property our caller is required to ensure -- this is ok.
+    #[cfg(has_fpu)]
     unsafe {
         arch::asm!("vstm {0}, {{s16-s31}}", in(reg) fpsave);
     }

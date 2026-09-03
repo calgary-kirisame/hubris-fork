@@ -17,6 +17,19 @@ use proc_macro2::TokenStream;
 fn main() -> Result<()> {
     build_util::expose_m_profile()?;
 
+    // Distinguish FPU-equipped cores from soft-float ones. The M-profile cfgs
+    // (armv6m/armv7m/armv8m) come purely from the architecture and say nothing
+    // about whether an FPU is fitted: both thumbv7em-none-eabi (e.g. Microchip
+    // MEC1521, FPU stripped) and thumbv7em-none-eabihf (FPU present) report
+    // `armv7m`. The hard-float ABI suffix is the reliable signal -- an `eabihf`
+    // toolchain expects to pass floats in FP registers and may execute FP
+    // instructions, an `eabi` one never touches them regardless of silicon. The
+    // context switch keys its FP save/restore off this.
+    println!("cargo::rustc-check-cfg=cfg(has_fpu)");
+    if build_util::target().ends_with("eabihf") {
+        println!("cargo:rustc-cfg=has_fpu");
+    }
+
     println!("cargo::rustc-check-cfg=cfg(hubris_phantom_svc_mitigation)");
     if build_util::target().starts_with("thumbv6m") {
         // Force SVC checks on for v6-M.
